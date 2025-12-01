@@ -73,15 +73,23 @@ app.get('/api/directories', async (req, res) => {
   try {
     const [directories] = await pool.query(`
       SELECT d.id, d.code AS name, d.created_at,
-        COUNT(DISTINCT CASE WHEN m.model_name != '_Reference' THEN m.id END) AS total_models,
-        COUNT(DISTINCT CASE WHEN latest_acr.error_count > 0 AND m.model_name != '_Reference' THEN m.id END) AS error_models,
-        COALESCE(SUM(CASE WHEN m.model_name != '_Reference' THEN latest_acr.error_count ELSE 0 END), 0) AS total_errors
+        COUNT(DISTINCT CASE WHEN m.model_name NOT LIKE '%Reference%' THEN m.id END) AS total_models,
+        -- Axes stats
+        COUNT(DISTINCT CASE WHEN latest_acr.error_count > 0 AND m.model_name NOT LIKE '%Reference%' THEN m.id END) AS axis_error_models,
+        COALESCE(SUM(CASE WHEN m.model_name NOT LIKE '%Reference%' THEN latest_acr.error_count ELSE 0 END), 0) AS axis_total_errors,
+        -- Levels stats
+        COUNT(DISTINCT CASE WHEN latest_lcr.error_count > 0 AND m.model_name NOT LIKE '%Reference%' THEN m.id END) AS level_error_models,
+        COALESCE(SUM(CASE WHEN m.model_name NOT LIKE '%Reference%' THEN latest_lcr.error_count ELSE 0 END), 0) AS level_total_errors
       FROM Directories d
       LEFT JOIN Models m ON d.id = m.directory_id
       LEFT JOIN (
         SELECT acr.model_id, acr.error_count FROM AxisCheckResults acr
         INNER JOIN (SELECT model_id, MAX(id) AS latest_check_id FROM AxisCheckResults GROUP BY model_id) latest ON acr.id = latest.latest_check_id
       ) latest_acr ON m.id = latest_acr.model_id
+      LEFT JOIN (
+        SELECT lcr.model_id, lcr.error_count FROM LevelCheckResults lcr
+        INNER JOIN (SELECT model_id, MAX(id) AS latest_check_id FROM LevelCheckResults GROUP BY model_id) latest ON lcr.id = latest.latest_check_id
+      ) latest_lcr ON m.id = latest_lcr.model_id
       GROUP BY d.id, d.code, d.created_at ORDER BY d.created_at DESC
     `);
     res.json(directories);
@@ -107,13 +115,21 @@ app.get('/api/directories/:id/models', async (req, res) => {
   try {
     const { id } = req.params;
     const [models] = await pool.query(`
-      SELECT m.id, m.model_name, m.updated_at, acr.id AS check_id, acr.check_date, acr.check_type,
-        acr.total_axes_in_model, acr.total_reference_axes, acr.error_count,
-        (acr.total_axes_in_model - acr.error_count) AS success_count
+      SELECT m.id, m.model_name, m.updated_at,
+        -- Axes data
+        acr.id AS axis_check_id, acr.check_date AS axis_check_date, acr.check_type AS axis_check_type,
+        acr.total_axes_in_model, acr.total_reference_axes, acr.error_count AS axis_error_count,
+        (acr.total_axes_in_model - acr.error_count) AS axis_success_count,
+        -- Levels data
+        lcr.id AS level_check_id, lcr.check_date AS level_check_date, lcr.check_type AS level_check_type,
+        lcr.total_levels_in_model, lcr.total_reference_levels, lcr.error_count AS level_error_count,
+        (lcr.total_levels_in_model - lcr.error_count) AS level_success_count
       FROM Models m
-      LEFT JOIN (SELECT model_id, MAX(id) AS latest_check_id FROM AxisCheckResults GROUP BY model_id) latest ON m.id = latest.model_id
-      LEFT JOIN AxisCheckResults acr ON latest.latest_check_id = acr.id
-      WHERE m.directory_id = ? AND m.model_name != '_Reference' ORDER BY m.model_name ASC
+      LEFT JOIN (SELECT model_id, MAX(id) AS latest_check_id FROM AxisCheckResults GROUP BY model_id) latest_axis ON m.id = latest_axis.model_id
+      LEFT JOIN AxisCheckResults acr ON latest_axis.latest_check_id = acr.id
+      LEFT JOIN (SELECT model_id, MAX(id) AS latest_check_id FROM LevelCheckResults GROUP BY model_id) latest_level ON m.id = latest_level.model_id
+      LEFT JOIN LevelCheckResults lcr ON latest_level.latest_check_id = lcr.id
+      WHERE m.directory_id = ? AND m.model_name NOT LIKE '%Reference%' ORDER BY m.model_name ASC
     `, [id]);
     res.json(models);
   } catch (error) {
@@ -185,7 +201,31 @@ app.get('/api/models/:id/check-report', async (req, res) => {
 });
 
 app.get('/api/models/:id/levels-report', async (req, res) => {
-  res.json({ has_data: false, message: 'Levels monitoring in development' });
+  try {
+    const { id } = req.params;
+    const [checkResults] = await pool.query(`
+      SELECT lcr.id, lcr.check_date, lcr.check_type, lcr.total_levels_in_model, lcr.total_reference_levels, lcr.error_count,
+        m.model_name, d.code AS directory_code
+      FROM LevelCheckResults lcr
+      JOIN Models m ON lcr.model_id = m.id
+      JOIN Directories d ON m.directory_id = d.id
+      WHERE lcr.model_id = ? ORDER BY lcr.check_date DESC LIMIT 1
+    `, [id]);
+    if (checkResults.length === 0) return res.json({ has_data: false, message: 'No level check results' });
+    const report = checkResults[0];
+    const [errors] = await pool.query(`
+      SELECT id, level_name, element_id, error_types, deviation_mm, is_pinned, workset_name
+      FROM LevelErrors WHERE check_result_id = ? ORDER BY level_name
+    `, [report.id]);
+    res.json({
+      has_data: true, ...report,
+      success_count: report.total_levels_in_model - report.error_count,
+      errors: errors.map(error => ({ ...error, error_types_array: error.error_types.split(';').map(t => t.trim()).filter(Boolean) }))
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to fetch levels report' });
+  }
 });
 
 app.get('/api/models/:id/sites-report', async (req, res) => {
@@ -211,19 +251,42 @@ app.get('/api/directories/:id/reference-axes', async (req, res) => {
   }
 });
 
+app.get('/api/directories/:id/reference-levels', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [levels] = await pool.query(`
+      SELECT l.id, l.level_name, l.elevation, l.created_at
+      FROM Levels l JOIN Models m ON l.model_id = m.id
+      WHERE m.directory_id = ? AND m.model_name = '_Reference' ORDER BY l.elevation
+    `, [id]);
+    res.json(levels);
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to fetch reference levels' });
+  }
+});
+
 app.get('/api/stats/overall', async (req, res) => {
   try {
     const [stats] = await pool.query(`
       SELECT COUNT(DISTINCT d.id) AS total_directories,
-        COUNT(DISTINCT CASE WHEN m.model_name != '_Reference' THEN m.id END) AS total_models,
-        COUNT(DISTINCT CASE WHEN latest_acr.error_count > 0 AND m.model_name != '_Reference' THEN m.id END) AS models_with_errors,
-        COALESCE(SUM(CASE WHEN m.model_name != '_Reference' THEN latest_acr.error_count ELSE 0 END), 0) AS total_errors
+        COUNT(DISTINCT CASE WHEN m.model_name NOT LIKE '%Reference%' THEN m.id END) AS total_models,
+        -- Axes stats
+        COUNT(DISTINCT CASE WHEN latest_acr.error_count > 0 AND m.model_name NOT LIKE '%Reference%' THEN m.id END) AS axis_models_with_errors,
+        COALESCE(SUM(CASE WHEN m.model_name NOT LIKE '%Reference%' THEN latest_acr.error_count ELSE 0 END), 0) AS axis_total_errors,
+        -- Levels stats
+        COUNT(DISTINCT CASE WHEN latest_lcr.error_count > 0 AND m.model_name NOT LIKE '%Reference%' THEN m.id END) AS level_models_with_errors,
+        COALESCE(SUM(CASE WHEN m.model_name NOT LIKE '%Reference%' THEN latest_lcr.error_count ELSE 0 END), 0) AS level_total_errors
       FROM Directories d
       LEFT JOIN Models m ON d.id = m.directory_id
       LEFT JOIN (
         SELECT acr.model_id, acr.error_count FROM AxisCheckResults acr
         INNER JOIN (SELECT model_id, MAX(id) AS latest_check_id FROM AxisCheckResults GROUP BY model_id) latest ON acr.id = latest.latest_check_id
       ) latest_acr ON m.id = latest_acr.model_id
+      LEFT JOIN (
+        SELECT lcr.model_id, lcr.error_count FROM LevelCheckResults lcr
+        INNER JOIN (SELECT model_id, MAX(id) AS latest_check_id FROM LevelCheckResults GROUP BY model_id) latest ON lcr.id = latest.latest_check_id
+      ) latest_lcr ON m.id = latest_lcr.model_id
     `);
     res.json(stats[0]);
   } catch (error) {
