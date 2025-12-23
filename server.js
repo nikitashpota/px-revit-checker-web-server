@@ -333,8 +333,11 @@ app.get('/api/navisworks-files/:id/clash-tests', async (req, res) => {
 app.get('/api/clash-tests/:id/results', async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, page = 1, limit = 50 } = req.query;
+    const { status, page = 1, limit = 50, min_distance = 0 } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Конвертируем мм в футы для запроса (в БД хранится в футах)
+    const minDistanceFeet = parseFloat(min_distance) / 304.8;
 
     const [test] = await pool.query(`
       SELECT ct.*, nf.filename, d.code AS directory_name
@@ -359,12 +362,29 @@ app.get('/api/clash-tests/:id/results', async (req, res) => {
       selectParams.push(status);
     }
 
+    // Фильтр по глубине (по модулю)
+    if (minDistanceFeet > 0) {
+      whereClause += ' AND ABS(distance) >= ?';
+      countParams.push(minDistanceFeet);
+      selectParams.push(minDistanceFeet);
+    }
+
     // Отдельный запрос для подсчёта
     const [countResult] = await pool.query(
       `SELECT COUNT(*) as total FROM ClashResults ${whereClause}`,
       countParams
     );
     const total = countResult[0].total;
+
+    // Получаем статистику по глубинам для слайдера
+    const [distanceStats] = await pool.query(`
+      SELECT 
+        MIN(ABS(distance)) * 304.8 as min_distance_mm,
+        MAX(ABS(distance)) * 304.8 as max_distance_mm,
+        AVG(ABS(distance)) * 304.8 as avg_distance_mm
+      FROM ClashResults 
+      WHERE clash_test_id = ?
+    `, [id]);
 
     // Запрос данных с пагинацией
     selectParams.push(parseInt(limit), offset);
@@ -375,13 +395,14 @@ app.get('/api/clash-tests/:id/results', async (req, res) => {
         item2_id, item2_name, item2_type, item2_layer, item2_source_file
       FROM ClashResults
       ${whereClause}
-      ORDER BY created_date DESC
+      ORDER BY ABS(distance) DESC
       LIMIT ? OFFSET ?
     `, selectParams);
 
     res.json({
       test: test[0],
       results,
+      distanceStats: distanceStats[0],
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -436,7 +457,7 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
     // 2. Получаем текущие данные из ClashTests
     let currentQuery = `
       SELECT 
-        CURDATE() as record_date,
+        DATE(ct.updated_at) as record_date,
         ct.id as clash_test_id,
         ct.name as test_name,
         ct.summary_total,
@@ -458,58 +479,102 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
 
     const [current] = await pool.query(currentQuery, currentParams);
 
-    // Группируем по датам
-    const dateMap = new Map();
-    
-    const addToDateMap = (row, dateKey) => {
-      if (!dateMap.has(dateKey)) {
-        dateMap.set(dateKey, {
+    // Собираем все данные, избегая дублирования
+    const dataMap = new Map(); // ключ: date_testId
+
+    // Добавляем историю
+    history.forEach(row => {
+      const dateKey = row.record_date.toISOString().split('T')[0];
+      const key = `${dateKey}_${row.clash_test_id}`;
+      dataMap.set(key, {
+        date: dateKey,
+        test_id: row.clash_test_id,
+        test_name: row.test_name,
+        total: row.summary_total || 0,
+        new: row.summary_new || 0,
+        active: row.summary_active || 0,
+        reviewed: row.summary_reviewed || 0,
+        approved: row.summary_approved || 0,
+        resolved: row.summary_resolved || 0
+      });
+    });
+
+    // Добавляем текущие данные только если их нет в истории за эту дату
+    current.forEach(row => {
+      const dateKey = row.record_date.toISOString().split('T')[0];
+      const key = `${dateKey}_${row.clash_test_id}`;
+      if (!dataMap.has(key)) {
+        dataMap.set(key, {
           date: dateKey,
+          test_id: row.clash_test_id,
+          test_name: row.test_name,
+          total: row.summary_total || 0,
+          new: row.summary_new || 0,
+          active: row.summary_active || 0,
+          reviewed: row.summary_reviewed || 0,
+          approved: row.summary_approved || 0,
+          resolved: row.summary_resolved || 0
+        });
+      }
+    });
+
+    // Группируем по датам для общей статистики
+    const dateMap = new Map();
+    const testLines = new Map(); // для отдельных линий по каждой проверке
+    
+    Array.from(dataMap.values()).forEach(row => {
+      // Общая статистика по датам
+      if (!dateMap.has(row.date)) {
+        dateMap.set(row.date, {
+          date: row.date,
           total: 0,
           new: 0,
           active: 0,
           reviewed: 0,
           approved: 0,
-          resolved: 0,
-          tests: []
+          resolved: 0
         });
       }
-      const entry = dateMap.get(dateKey);
-      entry.total += row.summary_total || 0;
-      entry.new += row.summary_new || 0;
-      entry.active += row.summary_active || 0;
-      entry.reviewed += row.summary_reviewed || 0;
-      entry.approved += row.summary_approved || 0;
-      entry.resolved += row.summary_resolved || 0;
-      entry.tests.push({
-        test_id: row.clash_test_id,
-        test_name: row.test_name,
-        total: row.summary_total,
-        new: row.summary_new,
-        active: row.summary_active
+      const entry = dateMap.get(row.date);
+      entry.total += row.total;
+      entry.new += row.new;
+      entry.active += row.active;
+      entry.reviewed += row.reviewed;
+      entry.approved += row.approved;
+      entry.resolved += row.resolved;
+
+      // Данные по каждой проверке отдельно
+      if (!testLines.has(row.test_id)) {
+        testLines.set(row.test_id, {
+          test_id: row.test_id,
+          test_name: row.test_name,
+          data: []
+        });
+      }
+      testLines.get(row.test_id).data.push({
+        date: row.date,
+        total: row.total,
+        new: row.new,
+        active: row.active,
+        activeSum: row.new + row.active,
+        resolved: row.resolved
       });
-    };
-
-    // Добавляем историю
-    history.forEach(row => {
-      const dateKey = row.record_date.toISOString().split('T')[0];
-      addToDateMap(row, dateKey);
     });
 
-    // Добавляем текущие данные (сегодня)
-    const today = new Date().toISOString().split('T')[0];
-    current.forEach(row => {
-      addToDateMap(row, today);
-    });
-
-    // Сортируем по дате
+    // Сортируем данные по датам
     const sortedHistory = Array.from(dateMap.values()).sort((a, b) => 
       new Date(a.date) - new Date(b.date)
     );
 
+    // Сортируем данные внутри каждой проверки по дате
+    const sortedTestLines = Array.from(testLines.values()).map(test => ({
+      ...test,
+      data: test.data.sort((a, b) => new Date(a.date) - new Date(b.date))
+    }));
+
     res.json({
       history: sortedHistory,
-      raw: [...history, ...current]
+      testLines: sortedTestLines
     });
   } catch (error) {
     console.error('Error:', error);
@@ -543,12 +608,14 @@ app.get('/api/directories/:id/clash-tests-list', async (req, res) => {
         ct.id,
         ct.name,
         ct.test_type,
+        ct.tolerance,
         ct.summary_total,
         ct.summary_new,
         ct.summary_active,
         ct.summary_reviewed,
         ct.summary_approved,
         ct.summary_resolved,
+        ct.updated_at,
         nf.filename
       FROM ClashTests ct
       JOIN NavisworksFiles nf ON ct.navisworks_file_id = nf.id
