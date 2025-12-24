@@ -426,11 +426,22 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
       ? test_ids.split(',').map(id => parseInt(id)).filter(id => !isNaN(id))
       : [];
 
+    // Если выбраны конкретные тесты, получаем их имена для фильтрации истории
+    let testNamesFilter = [];
+    if (parsedTestIds.length > 0) {
+      const [selectedTests] = await pool.query(`
+        SELECT ct.name, ct.navisworks_file_id
+        FROM ClashTests ct
+        WHERE ct.id IN (${parsedTestIds.map(() => '?').join(',')})
+      `, parsedTestIds);
+      testNamesFilter = selectedTests.map(t => ({ name: t.name, file_id: t.navisworks_file_id }));
+    }
+
     // 1. Получаем историю из ClashTestHistory
     let historyQuery = `
       SELECT 
         cth.record_date,
-        cth.clash_test_id,
+        cth.navisworks_file_id,
         cth.test_name,
         cth.summary_total,
         cth.summary_new,
@@ -445,9 +456,13 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
     `;
     const historyParams = [id, parseInt(days)];
 
-    if (parsedTestIds.length > 0) {
-      historyQuery += ` AND cth.clash_test_id IN (${parsedTestIds.map(() => '?').join(',')})`;
-      historyParams.push(...parsedTestIds);
+    // Фильтр по именам тестов (если выбраны)
+    if (testNamesFilter.length > 0) {
+      const conditions = testNamesFilter.map(() => '(cth.test_name = ? AND cth.navisworks_file_id = ?)');
+      historyQuery += ` AND (${conditions.join(' OR ')})`;
+      testNamesFilter.forEach(t => {
+        historyParams.push(t.name, t.file_id);
+      });
     }
 
     historyQuery += ` ORDER BY cth.record_date ASC`;
@@ -458,7 +473,7 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
     let currentQuery = `
       SELECT 
         DATE(ct.updated_at) as record_date,
-        ct.id as clash_test_id,
+        ct.navisworks_file_id,
         ct.name as test_name,
         ct.summary_total,
         ct.summary_new,
@@ -479,17 +494,15 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
 
     const [current] = await pool.query(currentQuery, currentParams);
 
-    // Собираем все данные, избегая дублирования
-    const dataMap = new Map(); // ключ: date_testId
+    // Собираем все данные, избегая дублирования (ключ: date + test_name + file_id)
+    const dataMap = new Map();
 
     // Добавляем историю
     history.forEach(row => {
       const dateKey = row.record_date.toISOString().split('T')[0];
-      const key = `${dateKey}_${row.clash_test_id}`;
+      const key = `${dateKey}_${row.navisworks_file_id}_${row.test_name}`;
       dataMap.set(key, {
         date: dateKey,
-        test_id: row.clash_test_id,
-        test_name: row.test_name,
         total: row.summary_total || 0,
         new: row.summary_new || 0,
         active: row.summary_active || 0,
@@ -502,12 +515,10 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
     // Добавляем текущие данные только если их нет в истории за эту дату
     current.forEach(row => {
       const dateKey = row.record_date.toISOString().split('T')[0];
-      const key = `${dateKey}_${row.clash_test_id}`;
+      const key = `${dateKey}_${row.navisworks_file_id}_${row.test_name}`;
       if (!dataMap.has(key)) {
         dataMap.set(key, {
           date: dateKey,
-          test_id: row.clash_test_id,
-          test_name: row.test_name,
           total: row.summary_total || 0,
           new: row.summary_new || 0,
           active: row.summary_active || 0,
@@ -518,12 +529,10 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
       }
     });
 
-    // Группируем по датам для общей статистики
+    // Группируем по датам для общей статистики (сумма)
     const dateMap = new Map();
-    const testLines = new Map(); // для отдельных линий по каждой проверке
     
     Array.from(dataMap.values()).forEach(row => {
-      // Общая статистика по датам
       if (!dateMap.has(row.date)) {
         dateMap.set(row.date, {
           date: row.date,
@@ -542,39 +551,15 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
       entry.reviewed += row.reviewed;
       entry.approved += row.approved;
       entry.resolved += row.resolved;
-
-      // Данные по каждой проверке отдельно
-      if (!testLines.has(row.test_id)) {
-        testLines.set(row.test_id, {
-          test_id: row.test_id,
-          test_name: row.test_name,
-          data: []
-        });
-      }
-      testLines.get(row.test_id).data.push({
-        date: row.date,
-        total: row.total,
-        new: row.new,
-        active: row.active,
-        activeSum: row.new + row.active,
-        resolved: row.resolved
-      });
     });
 
-    // Сортируем данные по датам
+    // Сортируем по датам
     const sortedHistory = Array.from(dateMap.values()).sort((a, b) => 
       new Date(a.date) - new Date(b.date)
     );
 
-    // Сортируем данные внутри каждой проверки по дате
-    const sortedTestLines = Array.from(testLines.values()).map(test => ({
-      ...test,
-      data: test.data.sort((a, b) => new Date(a.date) - new Date(b.date))
-    }));
-
     res.json({
-      history: sortedHistory,
-      testLines: sortedTestLines
+      history: sortedHistory
     });
   } catch (error) {
     console.error('Error:', error);
