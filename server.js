@@ -254,10 +254,7 @@ app.get('/api/directories/:id/clashes-report', async (req, res) => {
         COUNT(ct.id) AS tests_count,
         COALESCE(SUM(ct.summary_total), 0) AS total_clashes,
         COALESCE(SUM(ct.summary_new), 0) AS new_clashes,
-        COALESCE(SUM(ct.summary_active), 0) AS active_clashes,
-        COALESCE(SUM(ct.summary_reviewed), 0) AS reviewed_clashes,
-        COALESCE(SUM(ct.summary_approved), 0) AS approved_clashes,
-        COALESCE(SUM(ct.summary_resolved), 0) AS resolved_clashes
+        COALESCE(SUM(ct.summary_active), 0) AS active_clashes
       FROM NavisworksFiles nf
       LEFT JOIN ClashTests ct ON nf.id = ct.navisworks_file_id
       WHERE nf.directory_id = ?
@@ -274,11 +271,8 @@ app.get('/api/directories/:id/clashes-report', async (req, res) => {
       total_clashes: acc.total_clashes + parseInt(f.total_clashes),
       new_clashes: acc.new_clashes + parseInt(f.new_clashes),
       active_clashes: acc.active_clashes + parseInt(f.active_clashes),
-      reviewed_clashes: acc.reviewed_clashes + parseInt(f.reviewed_clashes),
-      approved_clashes: acc.approved_clashes + parseInt(f.approved_clashes),
-      resolved_clashes: acc.resolved_clashes + parseInt(f.resolved_clashes),
       tests_count: acc.tests_count + parseInt(f.tests_count)
-    }), { total_clashes: 0, new_clashes: 0, active_clashes: 0, reviewed_clashes: 0, approved_clashes: 0, resolved_clashes: 0, tests_count: 0 });
+    }), { total_clashes: 0, new_clashes: 0, active_clashes: 0, tests_count: 0 });
 
     res.json({
       has_data: true,
@@ -557,6 +551,18 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
     const sortedHistory = Array.from(dateMap.values()).sort((a, b) => 
       new Date(a.date) - new Date(b.date)
     );
+
+    // Вычисляем "решено" как разницу активных между датами
+    for (let i = 0; i < sortedHistory.length; i++) {
+      if (i === 0) {
+        sortedHistory[i].resolved = 0;
+      } else {
+        const prevActive = sortedHistory[i - 1].new + sortedHistory[i - 1].active;
+        const currActive = sortedHistory[i].new + sortedHistory[i].active;
+        const diff = prevActive - currActive;
+        sortedHistory[i].resolved = diff > 0 ? diff : 0;
+      }
+    }
 
     res.json({
       history: sortedHistory
