@@ -573,27 +573,34 @@ app.get('/api/directories/:id/clashes-history', async (req, res) => {
   }
 });
 
-// Получить список тестов для мультиселекта
+// Получить список тестов для мультиселекта (со статистикой по глубине)
 app.get('/api/directories/:id/clash-tests-list', async (req, res) => {
   try {
     const { id } = req.params;
-    const { sort = 'name', order = 'asc' } = req.query;
+    const { sort = 'name', order = 'asc', min_depth = 0 } = req.query;
+    
+    // Порог глубины в футах
+    const minDepthFeet = parseFloat(min_depth) / 304.8;
 
     let orderClause;
     switch (sort) {
       case 'total':
-        orderClause = `ct.summary_total ${order === 'desc' ? 'DESC' : 'ASC'}`;
+        orderClause = `filtered_total ${order === 'desc' ? 'DESC' : 'ASC'}`;
         break;
       case 'active':
-        orderClause = `(ct.summary_new + ct.summary_active) ${order === 'desc' ? 'DESC' : 'ASC'}`;
+        orderClause = `(filtered_new + filtered_active) ${order === 'desc' ? 'DESC' : 'ASC'}`;
         break;
       case 'new':
-        orderClause = `ct.summary_new ${order === 'desc' ? 'DESC' : 'ASC'}`;
+        orderClause = `filtered_new ${order === 'desc' ? 'DESC' : 'ASC'}`;
+        break;
+      case 'max_depth':
+        orderClause = `max_distance_mm ${order === 'desc' ? 'DESC' : 'ASC'}`;
         break;
       default:
         orderClause = `ct.name ${order === 'desc' ? 'DESC' : 'ASC'}`;
     }
 
+    // Запрос со статистикой по глубине и фильтрацией
     const [tests] = await pool.query(`
       SELECT 
         ct.id,
@@ -607,12 +614,28 @@ app.get('/api/directories/:id/clash-tests-list', async (req, res) => {
         ct.summary_approved,
         ct.summary_resolved,
         ct.updated_at,
-        nf.filename
+        nf.filename,
+        COALESCE(depth_stats.max_distance_mm, 0) as max_distance_mm,
+        COALESCE(depth_stats.avg_distance_mm, 0) as avg_distance_mm,
+        CAST(COALESCE(depth_stats.filtered_total, 0) AS UNSIGNED) as filtered_total,
+        CAST(COALESCE(depth_stats.filtered_new, 0) AS UNSIGNED) as filtered_new,
+        CAST(COALESCE(depth_stats.filtered_active, 0) AS UNSIGNED) as filtered_active
       FROM ClashTests ct
       JOIN NavisworksFiles nf ON ct.navisworks_file_id = nf.id
+      LEFT JOIN (
+        SELECT 
+          clash_test_id,
+          MAX(ABS(distance)) * 304.8 as max_distance_mm,
+          AVG(ABS(distance)) * 304.8 as avg_distance_mm,
+          COUNT(CASE WHEN ABS(distance) >= ? THEN 1 END) as filtered_total,
+          COUNT(CASE WHEN ABS(distance) >= ? AND status = 'New' THEN 1 END) as filtered_new,
+          COUNT(CASE WHEN ABS(distance) >= ? AND status = 'Active' THEN 1 END) as filtered_active
+        FROM ClashResults
+        GROUP BY clash_test_id
+      ) depth_stats ON ct.id = depth_stats.clash_test_id
       WHERE nf.directory_id = ?
       ORDER BY ${orderClause}
-    `, [id]);
+    `, [minDepthFeet, minDepthFeet, minDepthFeet, id]);
 
     res.json(tests);
   } catch (error) {
